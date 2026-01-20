@@ -132,10 +132,11 @@ class PDFGenerator:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Create PDF with proper margins
+        # Create PDF with proper margins (wider margins to prevent rendering issues)
         pdf = FPDF()
-        pdf.set_left_margin(10)
-        pdf.set_right_margin(10)
+        pdf.set_left_margin(15)
+        pdf.set_right_margin(15)
+        pdf.set_top_margin(15)
         pdf.add_page()
         pdf.set_auto_page_break(auto=True, margin=15)
         
@@ -151,8 +152,23 @@ class PDFGenerator:
             pdf.cell(0, 5, f'Generated: {timestamp}', ln=True, align='C')
             pdf.ln(10)
         
-        # Process markdown line by line
-        self._render_markdown(pdf, markdown)
+        # Process markdown line by line with error handling
+        try:
+            self._render_markdown(pdf, markdown)
+        except Exception as e:
+            logger.error(f"Error rendering markdown, using simplified mode: {e}")
+            # Fallback: render as plain text
+            pdf.set_font('Helvetica', '', 10)
+            pdf.set_x(pdf.l_margin)
+            # Split into manageable chunks
+            simple_text = markdown.replace('#', '').replace('**', '').replace('|', ' ')
+            for line in simple_text.split('\n')[:200]:  # Limit to 200 lines
+                if line.strip():
+                    try:
+                        pdf.set_x(pdf.l_margin)
+                        pdf.multi_cell(0, 5, line.strip()[:150])  # Max 150 chars
+                    except:
+                        pass  # Skip problematic lines
         
         # Save PDF
         pdf.output(str(output_path))
@@ -185,6 +201,7 @@ class PDFGenerator:
             if line.startswith('# '):
                 pdf.set_font('Helvetica', 'B', 14)
                 pdf.ln(5)
+                pdf.set_x(pdf.l_margin)  # Reset X position
                 pdf.multi_cell(0, 8, line[2:].strip())
                 pdf.ln(3)
                 i += 1
@@ -192,6 +209,7 @@ class PDFGenerator:
             elif line.startswith('## '):
                 pdf.set_font('Helvetica', 'B', 12)
                 pdf.ln(4)
+                pdf.set_x(pdf.l_margin)  # Reset X position
                 pdf.multi_cell(0, 7, line[3:].strip())
                 pdf.ln(2)
                 i += 1
@@ -199,6 +217,7 @@ class PDFGenerator:
             elif line.startswith('### '):
                 pdf.set_font('Helvetica', 'B', 11)
                 pdf.ln(3)
+                pdf.set_x(pdf.l_margin)  # Reset X position
                 pdf.multi_cell(0, 6, line[4:].strip())
                 pdf.ln(2)
                 i += 1
@@ -209,6 +228,14 @@ class PDFGenerator:
                 if not in_table:
                     # Table header
                     table_headers = [cell.strip() for cell in line.split('|')[1:-1]]
+                    # Skip tables with too many columns (>6) - they're too complex
+                    if len(table_headers) > 6:
+                        logger.warning(f"Skipping complex table with {len(table_headers)} columns")
+                        # Skip until end of table
+                        i += 1
+                        while i < len(lines) and '|' in lines[i]:
+                            i += 1
+                        continue
                     if table_headers:  # Only start table if headers exist
                         in_table = True
                         try:
@@ -256,14 +283,21 @@ class PDFGenerator:
             # Bold text **text**
             if '**' in line:
                 try:
-                    pdf.set_font('Helvetica', 'B', 10)
+                    # Remove ** markers and render as regular text to avoid font width issues
                     text = re.sub(r'\*\*(.*?)\*\*', r'\1', line)
-                    pdf.multi_cell(0, 5, text)
+                    pdf.set_font('Helvetica', 'B', 10)
+                    pdf.set_x(pdf.l_margin)  # Reset X position
+                    # Use write() instead of multi_cell() for bold text to avoid width calculation issues
+                    pdf.write(5, text)
+                    pdf.ln()
                 except Exception as e:
                     logger.error(f"Failed to render bold text: {line[:50]}... Error: {e}")
-                    # Try as regular text
+                    # Fallback: render as regular text without bold
+                    text = re.sub(r'\*\*(.*?)\*\*', r'\1', line)
                     pdf.set_font('Helvetica', '', 10)
-                    pdf.multi_cell(0, 5, line)
+                    pdf.set_x(pdf.l_margin)
+                    pdf.write(5, text)
+                    pdf.ln()
                 i += 1
                 continue
             
@@ -278,6 +312,7 @@ class PDFGenerator:
             # Regular text
             if line.strip():
                 pdf.set_font('Helvetica', '', 10)
+                pdf.set_x(pdf.l_margin)  # Reset X position
                 pdf.multi_cell(0, 5, line.strip())
             else:
                 pdf.ln(2)
@@ -291,23 +326,33 @@ class PDFGenerator:
             
         num_cols = len(cells)
         
+        # Skip tables that are too complex (>8 columns)
+        if num_cols > 8:
+            logger.warning(f"Skipping complex table with {num_cols} columns")
+            return
+        
         # Get effective page width (page width minus margins)
         effective_width = pdf.w - pdf.l_margin - pdf.r_margin
         col_width = effective_width / num_cols
         
-        # Adjust font size based on column count and width
+        # Adjust font size based on column count
         if num_cols <= 3:
-            font_size = 10
-        elif num_cols <= 6:
-            font_size = 8
-        else:
+            font_size = 9
+        elif num_cols <= 5:
             font_size = 7
+        else:
+            font_size = 6
         
         # Ensure minimum column width
-        min_col_width = 15
+        min_col_width = 12
         if col_width < min_col_width:
-            # Table too wide, use smaller font
-            font_size = max(6, font_size - 1)
+            logger.warning(f"Table too wide ({num_cols} cols, {col_width:.1f}mm each), rendering as text")
+            # Render as simple text instead
+            pdf.set_font('Helvetica', '', 8)
+            pdf.set_x(pdf.l_margin)
+            pdf.write(5, ' | '.join(str(c)[:20] for c in cells))
+            pdf.ln()
+            return
         
         if is_header:
             pdf.set_font('Helvetica', 'B', font_size)
@@ -315,19 +360,20 @@ class PDFGenerator:
             pdf.set_font('Helvetica', '', font_size)
         
         try:
+            pdf.set_x(pdf.l_margin)  # Reset X position
             for i, cell in enumerate(cells):
-                # Truncate very long cell values
-                display_text = str(cell)
-                max_chars = int(col_width / 2)  # Rough estimate: 2mm per char
+                # Sanitize and truncate cell content
+                display_text = self._sanitize_text(str(cell).strip())
+                max_chars = max(10, int(col_width / 2))  # Rough estimate: 2mm per char
                 if len(display_text) > max_chars:
-                    display_text = display_text[:max_chars-3] + "..."
-                pdf.cell(col_width, 6, display_text, border=1)
+                    display_text = display_text[:max_chars-2] + ".."
+                pdf.cell(col_width, 6, display_text, border=1, align='L')
             pdf.ln()
         except Exception as e:
-            logger.error(f"Error rendering table row: {e}, num_cols={num_cols}, col_width={col_width}")
-            # Try without borders as fallback
+            logger.error(f"Error rendering table row: {e}")
+            # Skip this row entirely
             try:
-                pdf.ln()
+                pdf.ln(2)
             except:
                 pass
     
