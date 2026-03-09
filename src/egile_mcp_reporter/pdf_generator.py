@@ -116,13 +116,14 @@ class PDFGenerator:
         styles: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
-        Convert markdown to PDF using fpdf2.
+        Convert markdown to PDF using best available method.
+        Priority: WeasyPrint (Linux/Mac) → ReportLab (Windows-friendly) → fpdf2 (fallback)
 
         Args:
             markdown: Markdown content
             output_path: Output PDF path
             title: Document title
-            styles: Optional (not used with fpdf2)
+            styles: Optional CSS style overrides
 
         Returns:
             Dictionary with file metadata
@@ -131,8 +132,128 @@ class PDFGenerator:
         
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime('%B %d, %Y at %I:%M %p')
         
-        # Create PDF with proper margins (wider margins to prevent rendering issues)
+        # Try WeasyPrint first (best quality, but requires GTK on Windows)
+        try:
+            from weasyprint import HTML, CSS
+            
+            # Convert markdown to HTML
+            html_content = md.markdown(
+                markdown,
+                extensions=['extra', 'tables', 'fenced_code', 'nl2br']
+            )
+            
+            # Build complete HTML document
+            full_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{title or 'Report'}</title>
+    <style>
+        {self._get_default_css()}
+        {styles.get('css', '') if styles else ''}
+    </style>
+</head>
+<body>
+    <div class="report-header">
+        <h1>{title or 'Report'}</h1>
+        <p class="generated-date">Generated: {timestamp}</p>
+    </div>
+    <div class="content">
+        {html_content}
+    </div>
+</body>
+</html>
+"""
+            
+            # Generate PDF using WeasyPrint
+            HTML(string=full_html).write_pdf(str(output_path))
+            
+            logger.info(f"✅ Generated PDF with WeasyPrint: {output_path}")
+            return {
+                "status": "success",
+                "format": "pdf",
+                "output_path": str(output_path),
+                "size": output_path.stat().st_size,
+                "generator": "weasyprint"
+            }
+            
+        except ImportError:
+            logger.info("WeasyPrint not available, trying ReportLab")
+        except Exception as e:
+            logger.warning(f"WeasyPrint failed ({str(e)[:100]}), trying ReportLab")
+        
+        # Try ReportLab (Windows-friendly, good quality)
+        try:
+            from reportlab.lib.pagesizes import letter, A4
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import inch
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+            from reportlab.lib import colors
+            from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+            import html as html_lib
+            
+            # Convert markdown to HTML first
+            html_content = md.markdown(
+                markdown,
+                extensions=['extra', 'tables', 'fenced_code', 'nl2br']
+            )
+            
+            # Create PDF document
+            doc = SimpleDocTemplate(str(output_path), pagesize=A4,
+                                   leftMargin=0.75*inch, rightMargin=0.75*inch,
+                                   topMargin=1*inch, bottomMargin=0.75*inch)
+            
+            # Build document content
+            story = []
+            styles = getSampleStyleSheet()
+            
+            # Add title if provided
+            if title:
+                title_style = ParagraphStyle(
+                    'CustomTitle',
+                    parent=styles['Heading1'],
+                    fontSize=20,
+                    textColor=colors.HexColor('#1e3a8a'),
+                    spaceAfter=12,
+                    alignment=TA_CENTER
+                )
+                story.append(Paragraph(html_lib.escape(title), title_style))
+                
+                # Add timestamp
+                timestamp_style = ParagraphStyle(
+                    'Timestamp',
+                    parent=styles['Normal'],
+                    fontSize=9,
+                    textColor=colors.grey,
+                    alignment=TA_CENTER,
+                    spaceAfter=20
+                )
+                story.append(Paragraph(f"Generated: {timestamp}", timestamp_style))
+            
+            # Parse HTML and convert to ReportLab elements
+            self._html_to_reportlab(html_content, story, styles)
+            
+            # Build PDF
+            doc.build(story)
+            
+            logger.info(f"✅ Generated PDF with ReportLab (Windows-compatible): {output_path}")
+            return {
+                "status": "success",
+                "format": "pdf",
+                "output_path": str(output_path),
+                "size": output_path.stat().st_size,
+                "generator": "reportlab"
+            }
+            
+        except ImportError:
+            logger.warning("ReportLab not available, falling back to fpdf2")
+        except Exception as e:
+            logger.error(f"ReportLab generation failed: {e}, falling back to fpdf2")
+        
+        # Fallback: Use fpdf2 (original implementation)
         pdf = FPDF()
         pdf.set_left_margin(15)
         pdf.set_right_margin(15)
@@ -148,7 +269,6 @@ class PDFGenerator:
             
             # Add generation timestamp
             pdf.set_font('Helvetica', 'I', 10)
-            timestamp = datetime.datetime.now().strftime('%B %d, %Y at %I:%M %p')
             pdf.cell(0, 5, f'Generated: {timestamp}', ln=True, align='C')
             pdf.ln(10)
         
@@ -173,11 +293,13 @@ class PDFGenerator:
         # Save PDF
         pdf.output(str(output_path))
         
+        logger.info(f"⚠️ Generated PDF with fpdf2 (limited formatting): {output_path}")
         return {
             "status": "success",
             "format": "pdf",
             "output_path": str(output_path),
             "size": output_path.stat().st_size,
+            "generator": "fpdf2"
         }
     
     def _render_markdown(self, pdf: FPDF, markdown_text: str):
@@ -320,7 +442,7 @@ class PDFGenerator:
             i += 1
     
     def _render_table_row(self, pdf: FPDF, cells: List[str], is_header: bool = False):
-        """Render a table row with proper column widths."""
+        """Render a table row with proper column widths that fit the page."""
         if not cells:
             return
             
@@ -335,40 +457,72 @@ class PDFGenerator:
         effective_width = pdf.w - pdf.l_margin - pdf.r_margin
         col_width = effective_width / num_cols
         
-        # Adjust font size based on column count
+        # Adjust font size based on column count to ensure content fits
         if num_cols <= 3:
             font_size = 9
+            max_chars_per_col = int(col_width * 0.5)  # Rough estimate
         elif num_cols <= 5:
             font_size = 7
+            max_chars_per_col = int(col_width * 0.6)
         else:
             font_size = 6
+            max_chars_per_col = int(col_width * 0.7)
         
         # Ensure minimum column width
         min_col_width = 12
         if col_width < min_col_width:
-            logger.warning(f"Table too wide ({num_cols} cols, {col_width:.1f}mm each), rendering as text")
-            # Render as simple text instead
-            pdf.set_font('Helvetica', '', 8)
-            pdf.set_x(pdf.l_margin)
-            pdf.write(5, ' | '.join(str(c)[:20] for c in cells))
-            pdf.ln()
+            logger.warning(f"Table too wide ({num_cols} cols, {col_width:.1f}mm each), splitting into multiple tables")
+            # Split table into chunks that fit
+            chunk_size = max(1, int(effective_width / min_col_width))
+            for i in range(0, num_cols, chunk_size):
+                chunk_cells = cells[i:i + chunk_size]
+                self._render_table_row(pdf, chunk_cells, is_header)
             return
         
         if is_header:
             pdf.set_font('Helvetica', 'B', font_size)
+            pdf.set_fill_color(30, 64, 175)  # Blue header
+            pdf.set_text_color(255, 255, 255)  # White text
         else:
             pdf.set_font('Helvetica', '', font_size)
+            pdf.set_fill_color(255, 255, 255)  # White background
+            pdf.set_text_color(0, 0, 0)  # Black text
         
         try:
             pdf.set_x(pdf.l_margin)  # Reset X position
+            row_height = 6
+            
             for i, cell in enumerate(cells):
-                # Sanitize and truncate cell content
+                # Sanitize and intelligently truncate cell content
                 display_text = self._sanitize_text(str(cell).strip())
-                max_chars = max(10, int(col_width / 2))  # Rough estimate: 2mm per char
-                if len(display_text) > max_chars:
-                    display_text = display_text[:max_chars-2] + ".."
-                pdf.cell(col_width, 6, display_text, border=1, align='L')
+                
+                # Smart truncation - preserve important info
+                if len(display_text) > max_chars_per_col:
+                    # Try to truncate at word boundary
+                    truncated = display_text[:max_chars_per_col-2]
+                    last_space = truncated.rfind(' ')
+                    if last_space > max_chars_per_col * 0.6:  # Only use word boundary if it's not too short
+                        display_text = truncated[:last_space] + ".."
+                    else:
+                        display_text = truncated + ".."
+                
+                # Use multi_cell for text wrapping within cells
+                x_position = pdf.get_x()
+                y_position = pdf.get_y()
+                
+                # Draw cell with fill color
+                pdf.cell(col_width, row_height, '', border=1, fill=True)
+                pdf.set_xy(x_position, y_position)
+                
+                # Add text with proper clipping
+                pdf.cell(col_width, row_height, display_text, border=1, align='L', fill=is_header)
+            
             pdf.ln()
+            
+            # Reset colors
+            pdf.set_fill_color(255, 255, 255)
+            pdf.set_text_color(0, 0, 0)
+            
         except Exception as e:
             logger.error(f"Error rendering table row: {e}")
             # Skip this row entirely
@@ -644,3 +798,178 @@ pre code {
     color: #f9fafb;
 }
 """
+    def _html_to_reportlab(self, html_content: str, story: list, styles):
+        """Convert HTML content to ReportLab flowables."""
+        from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib import colors
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.enums import TA_LEFT
+        import html as html_lib
+        from html.parser import HTMLParser
+        
+        class SimpleHTMLParser(HTMLParser):
+            """Simple HTML parser for converting to ReportLab."""
+            def __init__(self, story, styles):
+                super().__init__()
+                self.story = story
+                self.styles = styles
+                self.current_text = []
+                self.in_table = False
+                self.table_data = []
+                self.current_row = []
+                self.in_header = False
+                self.list_items = []
+                self.in_list = False
+                
+            def handle_starttag(self, tag, attrs):
+                if tag in ['h1', 'h2', 'h3']:
+                    self.flush_text()
+                    self.in_header = tag
+                elif tag == 'table':
+                    self.flush_text()
+                    self.in_table = True
+                    self.table_data = []
+                elif tag == 'tr':
+                    self.current_row = []
+                elif tag in ['th', 'td']:
+                    pass  # Will collect text
+                elif tag in ['ul', 'ol']:
+                    self.flush_text()
+                    self.in_list = True
+                    self.list_items = []
+                elif tag == 'li':
+                    pass  # Will collect text
+                elif tag == 'p':
+                    self.flush_text()
+                elif tag == 'br':
+                    self.current_text.append('<br/>')
+                elif tag == 'strong' or tag == 'b':
+                    self.current_text.append('<b>')
+                elif tag == 'em' or tag == 'i':
+                    self.current_text.append('<i>')
+                    
+            def handle_endtag(self, tag):
+                if tag in ['h1', 'h2', 'h3']:
+                    text = ''.join(self.current_text)
+                    if text.strip():
+                        style_map = {'h1': 'Heading1', 'h2': 'Heading2', 'h3': 'Heading3'}
+                        self.story.append(Paragraph(text, self.styles[style_map[tag]]))
+                        self.story.append(Spacer(1, 12))
+                    self.current_text = []
+                    self.in_header = False
+                elif tag == 'table':
+                    if self.table_data:
+                        # Calculate available width (A4 page with margins)
+                        from reportlab.lib.pagesizes import A4
+                        from reportlab.lib.units import inch
+                        page_width = A4[0]
+                        left_margin = 0.75 * inch
+                        right_margin = 0.75 * inch
+                        available_width = page_width - left_margin - right_margin
+                        
+                        # Calculate optimal column widths
+                        num_cols = len(self.table_data[0]) if self.table_data else 0
+                        if num_cols > 0:
+                            # Wrap cell content in Paragraphs for proper text wrapping
+                            wrapped_data = []
+                            cell_style = ParagraphStyle('CellStyle', parent=self.styles['Normal'], fontSize=8, leading=10)
+                            
+                            for row_idx, row in enumerate(self.table_data):
+                                wrapped_row = []
+                                for cell in row:
+                                    # Use smaller font for table cells
+                                    if row_idx == 0:  # Header
+                                        header_style = ParagraphStyle('HeaderStyle', parent=self.styles['Normal'], 
+                                                                     fontSize=9, leading=11, textColor=colors.white)
+                                        wrapped_row.append(Paragraph(str(cell), header_style))
+                                    else:
+                                        wrapped_row.append(Paragraph(str(cell), cell_style))
+                                wrapped_data.append(wrapped_row)
+                            
+                            # Calculate column widths - distribute evenly but with smart adjustments
+                            base_col_width = available_width / num_cols
+                            col_widths = [base_col_width] * num_cols
+                            
+                            # Adjust for very wide tables - reduce font and padding
+                            if num_cols > 6:
+                                # For tables with many columns, use even smaller font
+                                cell_style.fontSize = 7
+                                cell_style.leading = 8
+                            
+                            # Create table with calculated widths
+                            t = Table(wrapped_data, colWidths=col_widths, repeatRows=1)
+                            
+                            # Apply styles
+                            table_style = [
+                                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
+                                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                                ('FONTSIZE', (0, 0), (-1, 0), 9 if num_cols <= 6 else 7),
+                                ('LEFTPADDING', (0, 0), (-1, -1), 4),
+                                ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+                                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                                ('FONTSIZE', (0, 1), (-1, -1), 8 if num_cols <= 6 else 7),
+                                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9fafb')]),
+                            ]
+                            t.setStyle(TableStyle(table_style))
+                            
+                            self.story.append(t)
+                            self.story.append(Spacer(1, 12))
+                        else:
+                            logger.warning("Empty table detected, skipping")
+                    self.in_table = False
+                    self.table_data = []
+                elif tag == 'tr':
+                    if self.current_row:
+                        self.table_data.append(self.current_row)
+                    self.current_row = []
+                elif tag in ['th', 'td']:
+                    text = ''.join(self.current_text).strip()
+                    self.current_row.append(text)
+                    self.current_text = []
+                elif tag in ['ul', 'ol']:
+                    # Add list items
+                    for item in self.list_items:
+                        self.story.append(Paragraph(f"• {item}", self.styles['Normal']))
+                    self.story.append(Spacer(1, 6))
+                    self.in_list = False
+                    self.list_items = []
+                elif tag == 'li':
+                    text = ''.join(self.current_text).strip()
+                    if text:
+                        self.list_items.append(text)
+                    self.current_text = []
+                elif tag == 'p':
+                    self.flush_text()
+                elif tag == 'strong' or tag == 'b':
+                    self.current_text.append('</b>')
+                elif tag == 'em' or tag == 'i':
+                    self.current_text.append('</i>')
+                    
+            def handle_data(self, data):
+                if data.strip():
+                    self.current_text.append(html_lib.escape(data))
+                    
+            def flush_text(self):
+                text = ''.join(self.current_text).strip()
+                if text and not self.in_table and not self.in_list and not self.in_header:
+                    self.story.append(Paragraph(text, self.styles['Normal']))
+                    self.story.append(Spacer(1, 6))
+                self.current_text = []
+        
+        # Parse HTML
+        parser = SimpleHTMLParser(story, styles)
+        try:
+            parser.feed(html_content)
+            parser.flush_text()
+        except Exception as e:
+            logger.error(f"Error parsing HTML: {e}")
+            # Fallback: add as plain text
+            plain_text = html_content.replace('<', '&lt;').replace('>', '&gt;')
+            story.append(Paragraph(plain_text, styles['Normal']))

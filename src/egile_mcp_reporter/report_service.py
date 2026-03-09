@@ -63,7 +63,12 @@ class ReportService:
             ext = "pptx" if format == "pptx" else format
             output_path = str(self.output_dir / f"{safe_title}_{timestamp}.{ext}")
 
+        # Handle path resolution: if path starts with / or \, treat as relative to output_dir
         output_path = Path(output_path)
+        if not output_path.is_absolute() or str(output_path).startswith(('/', '\\')):
+            # Remove leading slash/backslash and make relative to output_dir
+            path_str = str(output_path).lstrip('/\\')
+            output_path = self.output_dir / path_str
 
         try:
             if format == "pdf":
